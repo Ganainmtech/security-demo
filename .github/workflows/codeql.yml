@@ -1,0 +1,79 @@
+name: "Teal Security Scan"
+
+on: [push, pull_request]
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup CodeQL CLI
+        run: |
+          wget https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip
+          unzip codeql-linux64.zip -d $HOME
+          echo "$HOME/codeql" >> $GITHUB_PATH
+          echo "CODEQL_ALLOW_INSTALLATION_ANYWHERE=true" >> $GITHUB_ENV
+
+      - name: Clone and Guerilla Patch
+        run: |
+          # 1. Clone your branch
+          git clone -b feat/add-gabe-security-examples https://github.com/Argimirodelpozo/codeql-TEAL.git $HOME/codeql-teal-repo
+          
+          # 2. THE FIX: Overwrite Argi's existing file with our "Safe" AST logic.
+          # This ensures the paths are perfect because we are using his original folder.
+          cat <<EOF > $HOME/codeql-teal-repo/sec-guide-detections/asset-close-to/assetCloseTo.ql
+          /**
+           * @name Missing AssetCloseTo Validation
+           * @kind problem
+           * @problem.severity critical
+           * @id teal/missing-asset-close-to
+           */
+          import codeql.teal.ast.AST
+
+          from Opcode o
+          where o.getOpcodeName() = "gtxns" and o.getImmediate() = "AssetAmount"
+            and not exists(Opcode close | 
+              close.getOpcodeName() = "gtxns" and close.getImmediate() = "AssetCloseTo"
+            )
+          select o, "Critical: This deposit validates amount but omits AssetCloseTo check, allowing a total balance drain."
+          EOF
+
+      - name: Build Extractor
+        run: |
+          export PATH=$HOME/codeql:$PATH
+          cd $HOME/codeql-teal-repo/teal/scripts
+          chmod +x create-extractor-pack.sh
+          ./create-extractor-pack.sh
+          
+      - name: Create Database
+        run: |
+          $HOME/codeql/codeql database create teal-db \
+            --language=teal \
+            --source-root=./contracts \
+            --search-path=$HOME/codeql-teal-repo/teal/extractor-pack
+
+      - name: Run Vertical Slice Analysis
+        run: |
+          # We run Argi's file path, but it now contains OUR safe code!
+          $HOME/codeql/codeql database analyze teal-db \
+            $HOME/codeql-teal-repo/sec-guide-detections/asset-close-to/assetCloseTo.ql \
+            --format=sarif-latest \
+            --output=results.sarif \
+            --search-path=$HOME/codeql-teal-repo/teal/extractor-pack
+          # NOTE: The search-path is automatically handled for internal libraries 
+          # when the query is inside the repo's structure.
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: "/language:teal"
