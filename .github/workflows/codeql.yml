@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       security-events: write
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -23,33 +24,42 @@ jobs:
           echo "$HOME/codeql" >> $GITHUB_PATH
           echo "CODEQL_ALLOW_INSTALLATION_ANYWHERE=true" >> $GITHUB_ENV
 
+      - name: Download Private Packs
+        run: |
+          echo "${{ secrets.GH_PACK_TOKEN }}" | $HOME/codeql/codeql pack download argimirodelpozo/teal-all --github-auth-stdin
+          echo "${{ secrets.GH_PACK_TOKEN }}" | $HOME/codeql/codeql pack download argimirodelpozo/teal-sec-guide-detections --github-auth-stdin
+
       - name: Clone and Guerilla Patch
         run: |
-          # 1. Clone your branch
           git clone -b feat/add-gabe-security-examples https://github.com/Argimirodelpozo/codeql-TEAL.git $HOME/codeql-teal-repo
           
-          # 2. THE FIX: Overwrite Argi's existing file with our "Safe" AST logic.
-          # This ensures the paths are perfect because we are using his original folder.
+          mkdir -p $HOME/codeql-teal-repo/sec-guide-detections/asset-close-to/
+          
+          # PROFESSIONAL QUERY: Using the InnerTransactionField class from your library
           cat <<EOF > $HOME/codeql-teal-repo/sec-guide-detections/asset-close-to/assetCloseTo.ql
           /**
            * @name Missing AssetCloseTo Validation
+           * @description Finding inner transactions that set an amount but don't clear the remainder, which can lead to balance draining.
            * @kind problem
            * @problem.severity critical
-           * @id teal/missing-asset-close-to
+           * @id teal/missing-itxn-asset-close-to
            */
           import codeql.teal.ast.AST
 
-          from Opcode o
-          where o.getOpcodeName() = "gtxns" and o.getImmediate() = "AssetAmount"
-            and not exists(Opcode close | 
-              close.getOpcodeName() = "gtxns" and close.getImmediate() = "AssetCloseTo"
+          from InnerTransactionField f, InnerTransactionStart start, InnerTransactionEnd end
+          where 
+            f.getItxnField() = "Amount" and
+            f.contributesToItxn(start, end) and
+            // Look for a missing Close check within the same transaction boundaries
+            not exists(InnerTransactionField close |
+              close.contributesToItxn(start, end) and
+              (close.getItxnField() = "AssetCloseTo" or close.getItxnField() = "CloseRemainderTo")
             )
-          select o, "Critical: This deposit validates amount but omits AssetCloseTo check, allowing a total balance drain."
+          select f, "Critical: This inner transaction sets an Amount but lacks an AssetCloseTo/CloseRemainderTo check."
           EOF
 
       - name: Build Extractor
         run: |
-          export PATH=$HOME/codeql:$PATH
           cd $HOME/codeql-teal-repo/teal/scripts
           chmod +x create-extractor-pack.sh
           ./create-extractor-pack.sh
@@ -61,16 +71,13 @@ jobs:
             --source-root=./contracts \
             --search-path=$HOME/codeql-teal-repo/teal/extractor-pack
 
-      - name: Run Vertical Slice Analysis
+      - name: Run Analysis
         run: |
-          # We run Argi's file path, but it now contains OUR safe code!
           $HOME/codeql/codeql database analyze teal-db \
             $HOME/codeql-teal-repo/sec-guide-detections/asset-close-to/assetCloseTo.ql \
             --format=sarif-latest \
             --output=results.sarif \
-            --search-path=$HOME/codeql-teal-repo/teal/extractor-pack
-          # NOTE: The search-path is automatically handled for internal libraries 
-          # when the query is inside the repo's structure.
+            --search-path=$HOME/codeql-teal-repo/teal/extractor-pack:$HOME/codeql-teal-repo/teal
 
       - name: Upload SARIF results
         uses: github/codeql-action/upload-sarif@v3
